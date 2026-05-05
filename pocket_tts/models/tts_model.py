@@ -11,6 +11,7 @@ from pathlib import Path
 
 import safetensors
 import safetensors.torch
+import scipy.io.wavfile
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -21,10 +22,10 @@ from pocket_tts.data.audio import audio_read
 from pocket_tts.data.audio_utils import convert_audio
 from pocket_tts.default_parameters import (
     DEFAULT_EOS_THRESHOLD,
+    DEFAULT_LANGUAGE,
     DEFAULT_LSD_DECODE_STEPS,
     DEFAULT_NOISE_CLAMP,
     DEFAULT_TEMPERATURE,
-    DEFAULT_VARIANT,
     MAX_TOKEN_PER_CHUNK,
 )
 from pocket_tts.models.flow_lm import FlowLMModel
@@ -34,11 +35,13 @@ from pocket_tts.modules.dummy_quantizer import DummyQuantizer
 from pocket_tts.modules.seanet import SEANetDecoder, SEANetEncoder
 from pocket_tts.modules.stateful_module import StatefulModule, increment_steps, init_states
 from pocket_tts.quantization import RECOMMENDED_CONFIG, apply_dynamic_int8
-from pocket_tts.utils.config import Config, load_config
+from pocket_tts.utils.config import CONFIGS_DIR, Config, load_config
 from pocket_tts.utils.utils import (
-    PREDEFINED_VOICES,
+    _ORIGINS_OF_PREDEFINED_VOICES,
+    DEBUG_MIMI,
     display_execution_time,
     download_if_necessary,
+    get_predefined_voice,
     size_of_dict,
 )
 from pocket_tts.utils.weights_loading import get_flow_lm_state_dict, get_mimi_state_dict
@@ -49,7 +52,7 @@ logger = logging.getLogger(__name__)
 VOICE_CLONING_UNSUPPORTED = (
     f"We could not download the weights for the model with voice cloning, "
     f"but you're trying to use voice cloning. "
-    f"Without voice cloning, you can use our catalog of voices {list(PREDEFINED_VOICES)}. "
+    f"Without voice cloning, you can use our catalog of voices {list(_ORIGINS_OF_PREDEFINED_VOICES.keys())}. "
     f"If you want access to the model with voice cloning, go to "
     f"https://huggingface.co/kyutai/pocket-tts and accept the terms, "
     f"then make sure you're logged in locally with `uvx hf auth login`."
@@ -68,6 +71,10 @@ class TTSModel(nn.Module):
         noise_clamp: float | None,
         eos_threshold,
         config: Config,
+        origin: Path | None = None,
+        pad_with_spaces_for_short_inputs: bool = False,
+        model_recommended_frames_after_eos: int | None = None,
+        remove_semicolons: bool = False,
     ):
         super().__init__()
         self.flow_lm = flow_lm
@@ -77,10 +84,14 @@ class TTSModel(nn.Module):
         self.eos_threshold = eos_threshold
         self.config = config
         self.has_voice_cloning = True
+        self.origin = origin
+        self.pad_with_spaces_for_short_inputs: bool = pad_with_spaces_for_short_inputs
+        self.model_recommended_frames_after_eos = model_recommended_frames_after_eos
+        self.remove_semicolons = remove_semicolons
 
     @property
-    def device(self) -> str:
-        return next(self.parameters()).device.type
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
 
     @property
     def sample_rate(self) -> int:
@@ -88,23 +99,54 @@ class TTSModel(nn.Module):
 
     @classmethod
     def _from_pydantic_config(
-        cls, config: Config, temp, lsd_decode_steps, noise_clamp: float | None, eos_threshold
+        cls,
+        config: Config,
+        temp,
+        lsd_decode_steps,
+        noise_clamp: float | None,
+        eos_threshold,
+        origin: Path | None,
     ) -> Self:
         flow_lm = FlowLMModel.from_pydantic_config(
-            config.flow_lm, latent_dim=config.mimi.quantizer.dimension
+            config.flow_lm,
+            latent_dim=config.mimi.quantizer.dimension,
+            insert_bos_before_voice=config.flow_lm.insert_bos_before_voice,
         )
-        tts_model = cls(flow_lm, temp, lsd_decode_steps, noise_clamp, eos_threshold, config)
+        tts_model = cls(
+            flow_lm,
+            temp,
+            lsd_decode_steps,
+            noise_clamp,
+            eos_threshold,
+            config,
+            origin=origin,
+            pad_with_spaces_for_short_inputs=config.pad_with_spaces_for_short_inputs,
+            model_recommended_frames_after_eos=config.model_recommended_frames_after_eos,
+            remove_semicolons=config.remove_semicolons,
+        )
         return tts_model
 
     @classmethod
     def _from_pydantic_config_with_weights(
-        cls, config: Config, temp, lsd_decode_steps, noise_clamp: float | None, eos_threshold
+        cls,
+        config: Config,
+        temp,
+        lsd_decode_steps,
+        noise_clamp: float | None,
+        eos_threshold,
+        origin: Path | None = None,
     ) -> Self:
         tts_model = cls._from_pydantic_config(
-            config, temp, lsd_decode_steps, noise_clamp, eos_threshold
+            config, temp, lsd_decode_steps, noise_clamp, eos_threshold, origin=origin
         )
         tts_model.flow_lm.speaker_proj_weight = torch.nn.Parameter(
-            torch.zeros((1024, 512), dtype=torch.float32)
+            torch.zeros(
+                (
+                    config.flow_lm.transformer.d_model,
+                    config.mimi.inner_dim or config.mimi.seanet.dimension,
+                ),
+                dtype=torch.float32,
+            )
         )
         if config.flow_lm.weights_path is not None:
             if config.mimi.weights_path is None:
@@ -137,6 +179,8 @@ class TTSModel(nn.Module):
             sample_rate=mimi_config["sample_rate"],
             frame_rate=mimi_config["frame_rate"],
             encoder_frame_rate=mimi_config["sample_rate"] / encoder.hop_length,
+            inner_dim=mimi_config["inner_dim"],
+            outer_dim=mimi_config["outer_dim"],
             encoder_transformer=encoder_transformer,
             decoder_transformer=decoder_transformer,
         ).to(device="cpu")
@@ -153,11 +197,7 @@ class TTSModel(nn.Module):
             tts_model.mimi.load_state_dict(mimi_state, strict=True)
 
         tts_model.mimi.eval()
-        # tts_model.to(dtype=torch.float32)
 
-        # uncomment to save the weights
-        # tts_model = tts_model.to(dtype=torch.bfloat16)
-        # safetensors.torch.save_file(tts_model.state_dict(), "tts_b6369a24.safetensors")
         if config.weights_path is not None:
             logger.info(f"Loading TTSModel weights from {config.weights_path}")
             try:
@@ -174,6 +214,10 @@ class TTSModel(nn.Module):
                 "No weights_path specified for FlowLM or TTSModel, model is uninitialized!"
             )
         size_in_mb = size_of_dict(tts_model.state_dict()) // 1e6
+        if os.environ.get("POCKET_TTS_SAVE_WEIGHTS", "0") == "1":
+            save_path = "./model.safetensors"
+            safetensors.torch.save_file(tts_model.state_dict(), save_path)
+            logger.info(f"Saved TTSModel weights to {save_path}")
         logging.info(f"TTS Model loaded successfully. Its size is {size_in_mb} MB")
 
         # TODO: move this in the __init__ and make self.mimi in __init__
@@ -188,7 +232,8 @@ class TTSModel(nn.Module):
     @classmethod
     def load_model(
         cls,
-        config: str | Path = DEFAULT_VARIANT,
+        language: str | None = None,
+        config: str | Path | None = None,
         temp: float | int = DEFAULT_TEMPERATURE,
         lsd_decode_steps: int = DEFAULT_LSD_DECODE_STEPS,
         noise_clamp: float | int | None = DEFAULT_NOISE_CLAMP,
@@ -202,8 +247,11 @@ class TTSModel(nn.Module):
         with the specified generation parameters and ready for inference.
 
         Args:
-            config: a path to a custom YAML config file saved locally (e.g., C://pocket_tts/pocket_tts_config.yaml)
-                or a model variant identifier (e.g., '610b0b2c'; must match a YAML file in the config directory).
+            language: Optional language identifier to select a predefined config. Incompatible with
+                the `config` argument. Available options
+                are `"english_2026-01"`, `"english_2026-04"`, `"english"`, `"french_24l"`, `"german_24l"`, `"portuguese"`, `"italian"`, `"spanish_24l"`.
+                If neither `config` nor `language` is provided, defaults to `"english", which is the same model as 'english_2026-04'`.
+            config: A path to a custom YAML config file saved locally (e.g., `"C://pocket_tts/pocket_tts_config.yaml"`).
             temp: Sampling temperature for generation. Higher values produce more
                 diverse but potentially lower quality output.
             lsd_decode_steps: Number of steps for Lagrangian Self Distillation
@@ -238,15 +286,27 @@ class TTSModel(nn.Module):
             model = TTSModel.load_model(quantize=True)
             ```
         """
-        if str(config).endswith(".yaml"):
-            config_path = Path(config)
-            config = load_config(config_path)
-            logger.info(f"Loading model from config at {config_path}...")
-        else:
-            config = load_config(Path(__file__).parents[1] / f"config/{config}.yaml")
+        if config is not None and language is not None:
+            raise ValueError(
+                "Cannot specify both config and language, please choose one or the other."
+            )
+        if config is None and language is None:
+            language = DEFAULT_LANGUAGE
+        if language is not None:
+            if language == "french":
+                raise ValueError(
+                    "For technical reasons, only a larger 24-layer model is available for French. Please use the 'french_24l' language instead."
+                )
+            config = CONFIGS_DIR / f"{language}.yaml"
+        config = Path(config)
+        if config.suffix not in (".yaml", ".yml"):
+            raise ValueError("Config should be a path to a YAML file ending with .yaml")
+        config_path = Path(config)
+        config = load_config(config_path)
+        logger.info(f"Loading model from config at {config_path}...")
 
         tts_model = TTSModel._from_pydantic_config_with_weights(
-            config, temp, lsd_decode_steps, noise_clamp, eos_threshold
+            config, temp, lsd_decode_steps, noise_clamp, eos_threshold, origin=config_path
         )
 
         if quantize:
@@ -306,8 +366,23 @@ class TTSModel(nn.Module):
         )
         return output_embeddings[:, None, :], is_eos
 
+    def _decode_and_dump(self, encoded: torch.Tensor, filename: str):
+        mimi_state = init_states(self.mimi, batch_size=1, sequence_length=10000)
+        if encoded.shape[1] == self.mimi.quantizer.dimension:
+            latent_to_decode = self.mimi.quantizer(encoded)
+        else:
+            latent_to_decode = encoded
+        resored_audio = self.mimi.decode_from_latent(latent_to_decode, mimi_state)
+        scipy.io.wavfile.write(filename, self.sample_rate, resored_audio.numpy())
+        logger.info("Saved restored audio from Mimi encoding to %s for debugging", filename)
+
     def _encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
         encoded = self.mimi.encode_to_latent(audio)
+
+        if DEBUG_MIMI:
+            # sanity check
+            self._decode_and_dump(encoded, "debug_encoded_latent_decoded.wav")
+
         latents = encoded.transpose(-1, -2).to(torch.float32)
         conditioning = F.linear(latents, self.flow_lm.speaker_proj_weight)
         return conditioning
@@ -525,17 +600,25 @@ class TTSModel(nn.Module):
             and audio decoding. Generation performance is logged including
             real-time factor (RTF) metrics.
         """
+        if frames_after_eos is None:
+            frames_after_eos = self.model_recommended_frames_after_eos
 
         # This is a very simplistic way of handling long texts. We could do much better
         # by using teacher forcing, but it would be a bit slower.
         # TODO: add the teacher forcing method for long texts where we use the audio of one chunk
         # as conditioning for the next chunk.
         chunks = split_into_best_sentences(
-            self.flow_lm.conditioner.tokenizer, text_to_generate, max_tokens
+            self.flow_lm.conditioner.tokenizer,
+            text_to_generate,
+            max_tokens,
+            self.pad_with_spaces_for_short_inputs,
+            remove_semicolons=self.remove_semicolons,
         )
 
         for chunk in chunks:
-            text_to_generate, frames_after_eos_guess = prepare_text_prompt(chunk)
+            text_to_generate, frames_after_eos_guess = prepare_text_prompt(
+                chunk, self.pad_with_spaces_for_short_inputs, self.remove_semicolons
+            )
             frames_after_eos_guess += 2
             effective_frames = (
                 frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
@@ -765,11 +848,25 @@ class TTSModel(nn.Module):
             if isinstance(audio_conditioning, str):
                 audio_conditioning = download_if_necessary(audio_conditioning)
 
-            return _import_model_state(audio_conditioning)
+            return _import_model_state(audio_conditioning, self.device)
 
-        elif isinstance(audio_conditioning, str) and audio_conditioning in PREDEFINED_VOICES:
+        elif (
+            isinstance(audio_conditioning, str)
+            and audio_conditioning in _ORIGINS_OF_PREDEFINED_VOICES
+        ):
             # We get the audio conditioning directly from the safetensors file.
-            return _import_model_state(download_if_necessary(PREDEFINED_VOICES[audio_conditioning]))
+            if self.origin is None or not self.origin.is_relative_to(CONFIGS_DIR):
+                raise ValueError(
+                    f"Cannot use predefined voices when the model "
+                    f"is not loaded from a config associated with a language."
+                    f"Here the origin is {self.origin}"
+                )
+            return _import_model_state(
+                download_if_necessary(
+                    get_predefined_voice(language=self.origin.stem, name=audio_conditioning)
+                ),
+                self.device,
+            )
 
         if not self.has_voice_cloning and isinstance(audio_conditioning, (str, Path)):
             raise ValueError(VOICE_CLONING_UNSUPPORTED)
@@ -793,6 +890,9 @@ class TTSModel(nn.Module):
         with display_execution_time("Encoding audio prompt"):
             prompt = self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
 
+        if self.flow_lm.insert_bos_before_voice:
+            prompt = torch.cat([self.flow_lm.bos_before_voice, prompt], dim=1)
+
         model_state = init_states(self.flow_lm, batch_size=1, sequence_length=prompt.shape[1])
 
         with display_execution_time("Prompting audio"):
@@ -810,11 +910,15 @@ class TTSModel(nn.Module):
         return math.ceil(gen_len_sec * frame_rate)
 
 
-def prepare_text_prompt(text: str) -> tuple[str, int]:
+def prepare_text_prompt(
+    text: str, pad_with_spaces_for_short_inputs: bool, remove_semicolons: bool
+) -> tuple[str, int]:
     text = text.strip()
     if text == "":
         raise ValueError("Text prompt cannot be empty")
     text = text.replace("\n", " ").replace("\r", " ").replace("  ", " ")
+    if remove_semicolons:
+        text = text.replace(";", ",")
     number_of_words = len(text.split())
     if number_of_words <= 4:
         frames_after_eos_guess = 3
@@ -832,7 +936,7 @@ def prepare_text_prompt(text: str) -> tuple[str, int]:
 
     # The model does not perform well when there are very few tokens, so
     # we can add empty spaces at the beginning to increase the token count.
-    if len(text.split()) < 5:
+    if pad_with_spaces_for_short_inputs and len(text.split()) < 5:
         text = " " * 8 + text
 
     return text, frames_after_eos_guess
@@ -871,8 +975,16 @@ def _segments_from_boundaries(
     return segments
 
 
-def split_into_best_sentences(tokenizer, text_to_generate: str, max_tokens: int) -> list[str]:
-    text_to_generate, _ = prepare_text_prompt(text_to_generate)
+def split_into_best_sentences(
+    tokenizer,
+    text_to_generate: str,
+    max_tokens: int,
+    pad_with_spaces_for_short_inputs: bool,
+    remove_semicolons: bool,
+) -> list[str]:
+    text_to_generate, _ = prepare_text_prompt(
+        text_to_generate, pad_with_spaces_for_short_inputs, remove_semicolons
+    )
     text_to_generate = text_to_generate.strip()
     tokens = tokenizer(text_to_generate)
     list_of_tokens = tokens.tokens[0].tolist()
@@ -940,7 +1052,9 @@ def export_model_state(model_state: dict[str, dict[str, torch.Tensor]], dest: st
     safetensors.torch.save_file(dict_to_store, dest)
 
 
-def _import_model_state(source: str | Path) -> dict[str, dict[str, torch.Tensor]]:
+def _import_model_state(
+    source: str | Path, device: torch.device
+) -> dict[str, dict[str, torch.Tensor]]:
     result = {}
     with safetensors.safe_open(source, framework="pt") as f:
         for key in f.keys():
@@ -951,8 +1065,8 @@ def _import_model_state(source: str | Path) -> dict[str, dict[str, torch.Tensor]
                 # but it's not needed anymore
                 tensor = f.get_tensor(key)
                 result[module_name]["offset"] = torch.full(
-                    (1,), fill_value=tensor.shape[0], dtype=torch.long, device=tensor.device
+                    (1,), fill_value=tensor.shape[0], dtype=torch.long, device=device
                 )
             else:
-                result[module_name][tensor_key] = f.get_tensor(key)
+                result[module_name][tensor_key] = f.get_tensor(key).to(device)
     return result
